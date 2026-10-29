@@ -4,6 +4,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
@@ -96,10 +97,21 @@ pub enum TextDirection {
     Rtl,
 }
 
+// Remembered size of the main window (logical pixels)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WindowSize {
+    pub width: f64,
+    pub height: f64,
+}
+
 // App config (stored in app data directory - just the notes folder path)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub notes_folder: Option<String>,
+    /// Last size of the main window, restored on the next launch when the
+    /// `rememberWindowSize` setting is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<WindowSize>,
 }
 
 // Per-folder settings (stored in .scratch/settings.json within notes folder)
@@ -135,6 +147,15 @@ pub struct Settings {
     pub custom_colors_light: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "customColorsDark")]
     pub custom_colors_dark: Option<std::collections::HashMap<String, String>>,
+    /// When enabled, a Markdown file opened from the operating system is shown
+    /// in a standalone window containing only that document, instead of the
+    /// full application UI. Defaults to enabled when unset.
+    #[serde(rename = "openFilesInPreviewMode")]
+    pub open_files_in_preview_mode: Option<bool>,
+    /// When enabled, the main window is restored to the size it had when the
+    /// app was last closed. Defaults to enabled when unset.
+    #[serde(rename = "rememberWindowSize")]
+    pub remember_window_size: Option<bool>,
 }
 
 // Search result
@@ -340,6 +361,9 @@ pub struct AppState {
     pub file_watcher: Mutex<Option<FileWatcherState>>,
     pub search_index: Mutex<Option<SearchIndex>>,
     pub debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    /// Monotonic counter used to drop stale window-size save jobs while the
+    /// user is still dragging the window edge.
+    pub window_size_generation: AtomicU64,
 }
 
 impl Default for AppState {
@@ -351,6 +375,7 @@ impl Default for AppState {
             file_watcher: Mutex::new(None),
             search_index: Mutex::new(None),
             debounce_map: Arc::new(Mutex::new(HashMap::new())),
+            window_size_generation: AtomicU64::new(0),
         }
     }
 }
@@ -755,6 +780,96 @@ fn save_app_config(app: &AppHandle, config: &AppConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config)?;
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Whether a Markdown file opened from the operating system should be shown in
+/// a standalone window containing only that document.
+/// Defaults to enabled when the setting has never been written.
+fn is_open_files_in_preview_mode(settings: &Settings) -> bool {
+    settings.open_files_in_preview_mode.unwrap_or(true)
+}
+
+/// Whether the last main-window size should be restored on startup.
+/// Defaults to enabled when the setting has never been written.
+fn is_remember_window_size(settings: &Settings) -> bool {
+    settings.remember_window_size.unwrap_or(true)
+}
+
+/// Store the current main-window size in the app config so it can be restored
+/// on the next launch. The size is only written when it actually changed.
+fn store_window_size(app: &AppHandle, state: &AppState, width: f64, height: f64) {
+    {
+        let mut app_config = state.app_config.write().expect("app_config write lock");
+        match app_config.window_size.as_mut() {
+            Some(size) => {
+                if (size.width - width).abs() < 0.5 && (size.height - height).abs() < 0.5 {
+                    return;
+                }
+                size.width = width;
+                size.height = height;
+            }
+            None => {
+                app_config.window_size = Some(WindowSize { width, height });
+            }
+        }
+    }
+
+    let app_config = state.app_config.read().expect("app_config read lock");
+    let _ = save_app_config(app, &app_config);
+}
+
+/// Persist the main-window size after the user finished resizing it.
+/// Writes are debounced so dragging a window edge does not hammer the disk,
+/// and superseded jobs are dropped instead of writing stale sizes.
+fn schedule_window_size_save(app: &AppHandle, width: f64, height: f64) {
+    let generation = match app.try_state::<AppState>() {
+        Some(state) => state.window_size_generation.fetch_add(1, Ordering::SeqCst) + 1,
+        None => return,
+    };
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        if state.window_size_generation.load(Ordering::SeqCst) != generation {
+            // A newer resize superseded this job.
+            return;
+        }
+        store_window_size(&app, &state, width, height);
+    });
+}
+
+/// Restore the remembered main-window size, if any.
+fn restore_window_size(app: &AppHandle) {
+    let (enabled, saved) = match app.try_state::<AppState>() {
+        Some(state) => {
+            let enabled = {
+                let settings = state.settings.read().expect("settings read lock");
+                is_remember_window_size(&settings)
+            };
+            let saved = {
+                let app_config = state.app_config.read().expect("app_config read lock");
+                app_config.window_size.clone()
+            };
+            (enabled, saved)
+        }
+        None => return,
+    };
+
+    if !enabled {
+        return;
+    }
+
+    let Some(size) = saved else { return };
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return;
+    }
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.set_size(tauri::LogicalSize::new(size.width, size.height));
+    }
 }
 
 // Load per-folder settings from disk
@@ -3558,6 +3673,70 @@ fn is_markdown_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a Markdown file handed to the app by the operating system should be
+/// displayed in a standalone window that shows only that document.
+/// Defaults to enabled when the setting has never been written.
+fn open_files_in_preview_mode(app: &AppHandle) -> bool {
+    match app.try_state::<AppState>() {
+        Some(state) => {
+            let settings = state.settings.read().expect("settings read lock");
+            is_open_files_in_preview_mode(&settings)
+        }
+        None => true,
+    }
+}
+
+/// Hide the main window so that only the opened document is visible.
+/// The main window is kept around while no notes folder is configured so new
+/// users can still complete onboarding through the folder picker.
+fn hide_main_window_for_preview(app: &AppHandle) {
+    let has_notes_folder = match app.try_state::<AppState>() {
+        Some(state) => state
+            .app_config
+            .read()
+            .expect("app_config read lock")
+            .notes_folder
+            .is_some(),
+        None => false,
+    };
+
+    if !has_notes_folder {
+        return;
+    }
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.hide();
+    }
+}
+
+/// Whether a document preview window is currently open.
+fn has_preview_window(app: &AppHandle) -> bool {
+    app.webview_windows()
+        .keys()
+        .any(|label| label.starts_with("preview-"))
+}
+
+/// Bring the main application window back (used when the user re-activates the
+/// app from the dock while a document preview is open).
+fn show_main_window(app: &AppHandle) {
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.show();
+        let _ = main_window.set_focus();
+    }
+}
+
+/// Bring the main application window back once the last document preview was
+/// closed. The check is deferred so the closing window is already unregistered.
+fn show_main_window_after_preview_closed(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        if !has_preview_window(&app) {
+            show_main_window(&app);
+        }
+    });
+}
+
 // Preview mode: create a lightweight window for editing a single file
 fn create_preview_window(app: &AppHandle, file_path: &str) -> Result<(), String> {
     use std::collections::hash_map::DefaultHasher;
@@ -3628,6 +3807,9 @@ fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
 fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
     let mut opened_file = false;
     let mut opened_preview = false;
+    // When enabled, a file handed to the app by the operating system is shown
+    // on its own, without revealing the full application UI.
+    let direct_file_open = open_files_in_preview_mode(app);
 
     for arg in args.iter().skip(1) {
         // Skip flags
@@ -3643,9 +3825,13 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
 
         if is_markdown_extension(&path) && path.is_file() {
             opened_file = true;
-            if !try_select_in_notes_folder(app, &path)
-                && create_preview_window(app, &path.to_string_lossy()).is_ok()
-            {
+            let shown = if direct_file_open {
+                create_preview_window(app, &path.to_string_lossy()).is_ok()
+            } else {
+                try_select_in_notes_folder(app, &path)
+                    || create_preview_window(app, &path.to_string_lossy()).is_ok()
+            };
+            if shown {
                 opened_preview = true;
             }
         } else if path.is_dir() {
@@ -3670,12 +3856,15 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
         }
     }
 
-    // If no files were opened, show and focus the main window
     if !opened_file {
+        // If no files were opened, show and focus the main window
         if let Some(main_window) = app.get_webview_window("main") {
             let _ = main_window.show();
             let _ = main_window.set_focus();
         }
+    } else if opened_preview {
+        // The document replaces the application UI, so hide the main window.
+        hide_main_window_for_preview(app);
     }
 
     opened_preview
@@ -3775,6 +3964,7 @@ pub fn run() {
                 file_watcher: Mutex::new(None),
                 search_index: Mutex::new(search_index),
                 debounce_map: Arc::new(Mutex::new(HashMap::new())),
+                window_size_generation: AtomicU64::new(0),
             };
             app.manage(state);
 
@@ -3782,6 +3972,9 @@ pub fn run() {
             if let Some(ref folder) = app.state::<AppState>().app_config.read().expect("app_config read lock").notes_folder.clone() {
                 let _ = app.asset_protocol_scope().allow_directory(folder, true);
             }
+
+            // Restore the window size the user had before the last close
+            restore_window_size(app.handle());
 
             // Handle CLI args on first launch; determine whether to show the main window.
             // When a standalone preview is opened (file outside the notes folder) and the
@@ -3834,6 +4027,25 @@ pub fn run() {
                     {
                         let _ = create_preview_window(app, &path.to_string_lossy());
                     }
+                }
+            }
+
+            // Remember the main window size so it can be restored on the next launch
+            if let tauri::WindowEvent::Resized(size) = event {
+                if window.label() == "main" {
+                    let scale_factor = window.scale_factor().unwrap_or(1.0);
+                    let width = size.width as f64 / scale_factor;
+                    let height = size.height as f64 / scale_factor;
+                    if width > 0.0 && height > 0.0 {
+                        schedule_window_size_save(window.app_handle(), width, height);
+                    }
+                }
+            }
+
+            // Bring the main window back once the last document preview is closed
+            if let tauri::WindowEvent::Destroyed = event {
+                if window.label().starts_with("preview-") {
+                    show_main_window_after_preview_closed(window.app_handle());
                 }
             }
         })
@@ -3901,14 +4113,33 @@ pub fn run() {
     // RunEvent::Opened is macOS-only in Tauri v2
     app.run(|_app_handle, _event| {
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Opened { urls } = _event {
-            for url in urls {
-                if let Ok(path) = url.to_file_path() {
-                    if is_markdown_extension(&path)
-                        && path.is_file()
-                        && !try_select_in_notes_folder(_app_handle, &path)
-                    {
-                        let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+        {
+            // The user re-activated the app (dock click / launch). Bring the main
+            // window back, but never reveal it while a document preview is open.
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                if !has_preview_window(_app_handle) {
+                    show_main_window(_app_handle);
+                }
+            }
+
+            if let tauri::RunEvent::Opened { urls } = _event {
+                // When enabled, the opened document is shown on its own instead of
+                // revealing the full application UI.
+                let direct_file_open = open_files_in_preview_mode(_app_handle);
+
+                for url in urls {
+                    if let Ok(path) = url.to_file_path() {
+                        if is_markdown_extension(&path) && path.is_file() {
+                            if direct_file_open {
+                                if create_preview_window(_app_handle, &path.to_string_lossy())
+                                    .is_ok()
+                                {
+                                    hide_main_window_for_preview(_app_handle);
+                                }
+                            } else if !try_select_in_notes_folder(_app_handle, &path) {
+                                let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+                            }
+                        }
                     }
                 }
             }
@@ -3993,4 +4224,84 @@ fn set_title_bar_theme(
         let _ = (app, is_dark, r, g, b);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 条件：设置项从未写入（None）。预期：两个新功能默认开启。
+    #[test]
+    fn new_settings_default_to_enabled() {
+        let settings = Settings::default();
+        assert!(is_open_files_in_preview_mode(&settings));
+        assert!(is_remember_window_size(&settings));
+    }
+
+    // 条件：用户显式把两个开关关掉。预期：两个功能都被禁用。
+    #[test]
+    fn new_settings_can_be_disabled_explicitly() {
+        let settings = Settings {
+            open_files_in_preview_mode: Some(false),
+            remember_window_size: Some(false),
+            ..Settings::default()
+        };
+        assert!(!is_open_files_in_preview_mode(&settings));
+        assert!(!is_remember_window_size(&settings));
+    }
+
+    // 条件：设置文件里存在两个开关。预期：以 camelCase 键名读写，与前端字段一致。
+    #[test]
+    fn settings_use_camel_case_json_keys() {
+        let settings = Settings {
+            open_files_in_preview_mode: Some(true),
+            remember_window_size: Some(false),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(json.contains("\"openFilesInPreviewMode\":true"));
+        assert!(json.contains("\"rememberWindowSize\":false"));
+
+        let parsed: Settings = serde_json::from_str(&json).expect("settings deserialize");
+        assert_eq!(parsed.open_files_in_preview_mode, Some(true));
+        assert_eq!(parsed.remember_window_size, Some(false));
+    }
+
+    // 条件：旧的 settings.json 没有新字段。预期：仍能正常解析，功能默认开启。
+    #[test]
+    fn legacy_settings_without_new_fields_still_parse() {
+        let legacy = r#"{"theme":{"mode":"system"}}"#;
+        let parsed: Settings = serde_json::from_str(legacy).expect("legacy settings parse");
+        assert!(is_open_files_in_preview_mode(&parsed));
+        assert!(is_remember_window_size(&parsed));
+    }
+
+    // 条件：应用配置里保存了窗口大小。预期：序列化后可以被重新读回，数值不变。
+    #[test]
+    fn app_config_round_trips_window_size() {
+        let config = AppConfig {
+            notes_folder: Some("/tmp/notes".to_string()),
+            window_size: Some(WindowSize {
+                width: 1280.0,
+                height: 800.0,
+            }),
+        };
+        let json = serde_json::to_string(&config).expect("config serialize");
+        assert!(json.contains("\"window_size\""));
+
+        let parsed: AppConfig = serde_json::from_str(&json).expect("config deserialize");
+        let size = parsed.window_size.expect("window size restored");
+        assert_eq!(size.width, 1280.0);
+        assert_eq!(size.height, 800.0);
+        assert_eq!(parsed.notes_folder.as_deref(), Some("/tmp/notes"));
+    }
+
+    // 条件：旧的 config.json 里没有窗口大小字段。预期：解析成功且窗口大小为空。
+    #[test]
+    fn legacy_app_config_without_window_size_parses() {
+        let legacy = r#"{"notes_folder":"/tmp/notes"}"#;
+        let parsed: AppConfig = serde_json::from_str(legacy).expect("legacy config parse");
+        assert!(parsed.window_size.is_none());
+        assert_eq!(parsed.notes_folder.as_deref(), Some("/tmp/notes"));
+    }
 }
