@@ -62,13 +62,18 @@ import { useOptionalNotes } from "../../context/NotesContext";
 import { useTheme } from "../../context/ThemeContext";
 import { Frontmatter } from "./Frontmatter";
 import { BlockMathEditor } from "./BlockMathEditor";
+import { InlineMathEditor } from "./InlineMathEditor";
 import { LinkEditor } from "./LinkEditor";
 import { SearchToolbar } from "./SearchToolbar";
 import { SlashCommand } from "./SlashCommand";
 import { Wikilink, type WikilinkStorage } from "./Wikilink";
 import { WikilinkSuggestion } from "./WikilinkSuggestion";
 import { EditorWidthHandles } from "./EditorWidthHandle";
-import { ScratchBlockMath, normalizeBlockMath } from "./MathExtensions";
+import {
+  ScratchBlockMath,
+  ScratchInlineMath,
+  normalizeBlockMath,
+} from "./MathExtensions";
 import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
 import { Button, IconButton, ToolbarButton, Tooltip } from "../ui";
@@ -586,6 +591,7 @@ export function Editor({
   const saveTimeoutRef = useRef<number | null>(null);
   const linkPopupRef = useRef<TippyInstance | null>(null);
   const blockMathPopupRef = useRef<TippyInstance | null>(null);
+  const inlineMathPopupRef = useRef<TippyInstance | null>(null);
   const isLoadingRef = useRef(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
@@ -788,6 +794,94 @@ export function Editor({
     }
   }, []);
 
+  const closeInlineMathPopup = useCallback(() => {
+    if (inlineMathPopupRef.current) {
+      inlineMathPopupRef.current.destroy();
+      inlineMathPopupRef.current = null;
+    }
+  }, []);
+
+  const handleEditInlineMath = useCallback(
+    (pos: number) => {
+      const currentEditor = editorRef.current;
+      if (!currentEditor) return;
+
+      if (linkPopupRef.current) {
+        linkPopupRef.current.destroy();
+        linkPopupRef.current = null;
+      }
+      closeBlockMathPopup();
+      closeInlineMathPopup();
+
+      const node = currentEditor.state.doc.nodeAt(pos);
+      if (!node || node.type.name !== "inlineMath") {
+        return;
+      }
+
+      const virtualElement = {
+        getBoundingClientRect: () => {
+          const nodeDom = currentEditor.view.nodeDOM(pos);
+          if (nodeDom instanceof HTMLElement) {
+            return nodeDom.getBoundingClientRect();
+          }
+
+          const coords = currentEditor.view.coordsAtPos(pos);
+          return {
+            width: Math.max(2, coords.right - coords.left),
+            height: Math.max(20, coords.bottom - coords.top),
+            top: coords.top,
+            left: coords.left,
+            right: coords.right,
+            bottom: coords.bottom,
+            x: coords.left,
+            y: coords.top,
+            toJSON: () => ({}),
+          } as DOMRect;
+        },
+      };
+
+      const component = new ReactRenderer(InlineMathEditor, {
+        props: {
+          initialLatex: String(node.attrs.latex ?? ""),
+          onSubmit: (latex: string) => {
+            const trimmed = latex.trim();
+            if (!trimmed) {
+              toast.error("Please enter a formula.");
+              return;
+            }
+            currentEditor
+              .chain()
+              .focus()
+              .updateInlineMath({ pos, latex: trimmed })
+              .run();
+            closeInlineMathPopup();
+          },
+          onCancel: () => {
+            currentEditor.commands.focus();
+            closeInlineMathPopup();
+          },
+        },
+        editor: currentEditor,
+      });
+
+      inlineMathPopupRef.current = tippy(document.body, {
+        getReferenceClientRect: () =>
+          virtualElement.getBoundingClientRect() as DOMRect,
+        appendTo: () => document.body,
+        content: component.element,
+        showOnCreate: true,
+        interactive: true,
+        trigger: "manual",
+        placement: "bottom-start",
+        offset: [0, 8],
+        onDestroy: () => {
+          component.destroy();
+        },
+      });
+    },
+    [closeBlockMathPopup, closeInlineMathPopup],
+  );
+
   const handleEditBlockMath = useCallback(
     (pos: number) => {
       const currentEditor = editorRef.current;
@@ -798,6 +892,7 @@ export function Editor({
         linkPopupRef.current = null;
       }
       closeBlockMathPopup();
+      closeInlineMathPopup();
 
       const node = currentEditor.state.doc.nodeAt(pos);
       if (!node || node.type.name !== "blockMath") {
@@ -878,7 +973,7 @@ export function Editor({
         },
       });
     },
-    [closeBlockMathPopup],
+    [closeBlockMathPopup, closeInlineMathPopup],
   );
 
   const handleAddBlockMath = useCallback(() => {
@@ -886,6 +981,7 @@ export function Editor({
     if (!currentEditor) return;
 
     closeBlockMathPopup();
+    closeInlineMathPopup();
     if (linkPopupRef.current) {
       linkPopupRef.current.destroy();
       linkPopupRef.current = null;
@@ -1043,7 +1139,7 @@ export function Editor({
         component.destroy();
       },
     });
-  }, [closeBlockMathPopup, handleEditBlockMath]);
+  }, [closeBlockMathPopup, closeInlineMathPopup, handleEditBlockMath]);
 
   const editor = useEditor({
     textDirection,
@@ -1127,6 +1223,16 @@ export function Editor({
         },
         onClick: (_node, pos) => {
           handleEditBlockMath(pos);
+        },
+      }),
+      ScratchInlineMath.configure({
+        katexOptions: {
+          throwOnError: false,
+          displayMode: false,
+          macros: katexMacros,
+        },
+        onClick: (_node, pos) => {
+          handleEditInlineMath(pos);
         },
       }),
     ],

@@ -584,6 +584,17 @@ html.dark {
   max-width: 100%;
 }
 
+/* Inline math stays on the text baseline and must not grow the line box */
+.prose .tiptap-mathematics-render[data-type="inline-math"] {
+  vertical-align: baseline;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.prose .tiptap-mathematics-render[data-type="inline-math"] .katex {
+  font-size: 1em;
+}
+
 .prose
   .tiptap-mathematics-render[data-type="block-math"].ProseMirror-selectednode {
   outline: 2px solid var(--color-bg-emphasis);
@@ -600,6 +611,11 @@ html.dark {
 }
 
 .prose .block-math-error {
+  color: #dc2626;
+  font-family: var(--font-mono);
+}
+
+.prose .inline-math-error {
   color: #dc2626;
   font-family: var(--font-mono);
 }
