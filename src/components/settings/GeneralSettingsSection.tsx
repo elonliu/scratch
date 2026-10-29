@@ -299,7 +299,58 @@ export function GeneralSettingsSection() {
               notes are shown in a flat list sorted by date.
             </p>
           </div>
-          <FoldersToggle />
+          <SettingsToggle
+            settingKey="foldersEnabled"
+            defaultEnabled={false}
+            label="folder"
+          />
+        </div>
+      </section>
+
+      {/* Divider */}
+      <div className="border-t border-border border-dashed" />
+
+      {/* Open Files Directly Section */}
+      <section className="pb-2">
+        <div className="flex items-center justify-between gap-6">
+          <div className="flex flex-col gap-0.75">
+            <div className="flex items-center gap-2">
+              <h2 className="text-xl font-medium">Open Files Directly</h2>
+            </div>
+            <p className="text-sm text-text-muted max-w-lg">
+              Double-click a Markdown file to show only that document, without
+              opening the main app window. Useful when Scratch is your default
+              Markdown app.
+            </p>
+          </div>
+          <SettingsToggle
+            settingKey="openFilesInPreviewMode"
+            defaultEnabled
+            label="file preview"
+          />
+        </div>
+      </section>
+
+      {/* Divider */}
+      <div className="border-t border-border border-dashed" />
+
+      {/* Remember Window Size Section */}
+      <section className="pb-2">
+        <div className="flex items-center justify-between gap-6">
+          <div className="flex flex-col gap-0.75">
+            <div className="flex items-center gap-2">
+              <h2 className="text-xl font-medium">Remember Window Size</h2>
+            </div>
+            <p className="text-sm text-text-muted max-w-lg">
+              Restore the window size from your last session the next time you
+              open Scratch.
+            </p>
+          </div>
+          <SettingsToggle
+            settingKey="rememberWindowSize"
+            defaultEnabled
+            label="window size"
+          />
         </div>
       </section>
 
@@ -749,38 +800,56 @@ export function GeneralSettingsSection() {
   );
 }
 
-function FoldersToggle() {
-  const [foldersEnabled, setFoldersEnabled] = useState<boolean | null>(null);
+type BooleanSettingKey =
+  | "foldersEnabled"
+  | "openFilesInPreviewMode"
+  | "rememberWindowSize";
+
+interface SettingsToggleProps {
+  settingKey: BooleanSettingKey;
+  // Value applied when the backend has no explicit value for the setting
+  defaultEnabled: boolean;
+  // Human-readable setting name used in error messages
+  label: string;
+}
+
+function SettingsToggle({
+  settingKey,
+  defaultEnabled,
+  label,
+}: SettingsToggleProps) {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
   const [isUpdating, setIsUpdating] = useState(false);
 
   useEffect(() => {
     invoke<Settings>("get_settings")
       .then((s) => {
-        setFoldersEnabled(s.foldersEnabled === true);
+        const value = s[settingKey];
+        setEnabled(value === undefined ? defaultEnabled : value);
       })
       .catch((error) => {
-        console.error("Failed to load folder setting:", error);
-        setFoldersEnabled(false);
+        console.error(`Failed to load ${label} setting:`, error);
+        setEnabled(defaultEnabled);
       });
-  }, []);
+  }, [settingKey, defaultEnabled, label]);
 
-  const handleToggle = async (enabled: boolean) => {
+  const handleToggle = async (next: boolean) => {
     if (isUpdating) return;
     setIsUpdating(true);
     try {
       const settings = await invoke<Settings>("get_settings");
       await invoke("update_settings", {
-        newSettings: { ...settings, foldersEnabled: enabled },
+        newSettings: { ...settings, [settingKey]: next },
       });
-      setFoldersEnabled(enabled);
+      setEnabled(next);
     } catch {
-      toast.error("Failed to update folder setting");
+      toast.error(`Failed to update ${label} setting`);
     } finally {
       setIsUpdating(false);
     }
   };
 
-  if (foldersEnabled === null) {
+  if (enabled === null) {
     return (
       <div className="flex gap-1 p-1 rounded-[10px] border border-border shrink-0">
         <Button variant="ghost" size="xs" disabled>
@@ -797,7 +866,7 @@ function FoldersToggle() {
     <div className="flex gap-1 p-1 rounded-[10px] border border-border shrink-0">
       <Button
         onClick={() => handleToggle(false)}
-        variant={!foldersEnabled ? "primary" : "ghost"}
+        variant={!enabled ? "primary" : "ghost"}
         size="xs"
         disabled={isUpdating}
       >
@@ -805,7 +874,7 @@ function FoldersToggle() {
       </Button>
       <Button
         onClick={() => handleToggle(true)}
-        variant={foldersEnabled ? "primary" : "ghost"}
+        variant={enabled ? "primary" : "ghost"}
         size="xs"
         disabled={isUpdating}
       >

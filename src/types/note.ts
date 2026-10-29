@@ -49,6 +49,8 @@ export interface Settings {
   editorFont?: EditorFontSettings;
   gitEnabled?: boolean;
   foldersEnabled?: boolean;
+  openFilesInPreviewMode?: boolean;
+  rememberWindowSize?: boolean;
   pinnedNoteIds?: string[];
   textDirection?: TextDirection;
   editorWidth?: EditorWidth;
