@@ -3805,6 +3805,7 @@ fn set_app_ready() {
     APP_READY.store(true, Ordering::SeqCst);
 }
 
+#[cfg(target_os = "macos")]
 fn queue_opened_document(path: PathBuf) {
     PENDING_OPENED_DOCS
         .lock()
@@ -3871,6 +3872,7 @@ fn has_preview_window(app: &AppHandle) -> bool {
 
 /// Bring the main application window back (used when the user re-activates the
 /// app from the dock while a document preview is open).
+#[cfg(target_os = "macos")]
 fn show_main_window(app: &AppHandle) {
     if let Some(main_window) = app.get_webview_window("main") {
         let _ = main_window.show();
