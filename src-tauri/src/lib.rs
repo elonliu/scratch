@@ -368,6 +368,10 @@ pub struct AppState {
     /// Monotonic counter used to drop stale window-size save jobs while the
     /// user is still dragging the window edge.
     pub window_size_generation: AtomicU64,
+    /// Note the operating system asked to open before the main window was
+    /// ready to receive the `select-note` event. The frontend picks it up
+    /// once it mounts.
+    pub pending_note_id: Mutex<Option<String>>,
 }
 
 impl Default for AppState {
@@ -380,6 +384,7 @@ impl Default for AppState {
             search_index: Mutex::new(None),
             debounce_map: Arc::new(Mutex::new(HashMap::new())),
             window_size_generation: AtomicU64::new(0),
+            pending_note_id: Mutex::new(None),
         }
     }
 }
@@ -1910,6 +1915,17 @@ async fn move_folder(
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Settings {
     state.settings.read().expect("settings read lock").clone()
+}
+
+/// Hand over the note that was requested before the main window was ready.
+/// Returns the note id once and clears it, so a later start does not reopen it.
+#[tauri::command]
+fn take_pending_note_id(state: State<AppState>) -> Option<String> {
+    state
+        .pending_note_id
+        .lock()
+        .expect("pending note mutex")
+        .take()
 }
 
 #[tauri::command]
@@ -3705,7 +3721,17 @@ fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
         None => return false,
     };
 
-    let _ = app.emit_to("main", "select-note", note_id);
+    let _ = app.emit_to("main", "select-note", note_id.clone());
+    if !is_app_ready() {
+        // The main window is not listening yet during startup, so remember the
+        // selection and let the frontend pick it up once it mounts.
+        if let Some(state) = app.try_state::<AppState>() {
+            *state
+                .pending_note_id
+                .lock()
+                .expect("pending note mutex") = Some(note_id);
+        }
+    }
     if let Some(main_window) = app.get_webview_window("main") {
         let _ = main_window.show();
         let _ = main_window.set_focus();
@@ -4104,6 +4130,7 @@ pub fn run() {
                 search_index: Mutex::new(search_index),
                 debounce_map: Arc::new(Mutex::new(HashMap::new())),
                 window_size_generation: AtomicU64::new(0),
+                pending_note_id: Mutex::new(None),
             };
             app.manage(state);
 
@@ -4225,6 +4252,7 @@ pub fn run() {
             move_note,
             move_folder,
             get_settings,
+            take_pending_note_id,
             update_settings,
             update_git_enabled,
             preview_note_name,

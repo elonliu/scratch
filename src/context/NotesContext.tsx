@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { Note, NoteMetadata } from "../types/note";
 import * as notesService from "../services/notes";
 import type { SearchResult } from "../services/notes";
@@ -670,6 +671,24 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     });
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, [selectNote, refreshNotes]);
+
+  // Pick up a note the backend was asked to open before this window was ready
+  // (for example a Markdown file opened from the file manager at launch).
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string | null>("take_pending_note_id")
+      .then((id) => {
+        if (!id || cancelled) return;
+        refreshNotes();
+        selectNote(id);
+      })
+      .catch(() => {
+        // No pending selection: nothing to do.
+      });
+    return () => {
+      cancelled = true;
     };
   }, [selectNote, refreshNotes]);
 
