@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Push events do not trigger workflows in this fork, so the CI run has to be
+  # started manually from the Actions tab or with `gh workflow run ci.yml`.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
