@@ -4,8 +4,8 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -3709,6 +3709,82 @@ fn hide_main_window_for_preview(app: &AppHandle) {
     }
 }
 
+/// Documents that macOS handed to the app before it finished starting up.
+/// On macOS the `application:openFiles:` event is delivered before the Tauri
+/// `setup` closure runs, so the notes folder and the settings are not loaded
+/// yet. Those documents are queued here and opened once the app is ready.
+static PENDING_OPENED_DOCS: LazyLock<Mutex<Vec<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Whether the app finished its startup sequence and can open documents
+/// right away.
+static APP_READY: AtomicBool = AtomicBool::new(false);
+
+fn is_app_ready() -> bool {
+    APP_READY.load(Ordering::SeqCst)
+}
+
+fn set_app_ready() {
+    APP_READY.store(true, Ordering::SeqCst);
+}
+
+fn queue_opened_document(path: PathBuf) {
+    PENDING_OPENED_DOCS
+        .lock()
+        .expect("pending documents mutex")
+        .push(path);
+}
+
+/// Open the documents that were delivered before the app was ready.
+/// Returns true when at least one of them is shown in a preview window.
+fn open_queued_documents(app: &AppHandle) -> bool {
+    let documents = {
+        let mut queue = PENDING_OPENED_DOCS
+            .lock()
+            .expect("pending documents mutex");
+        std::mem::take(&mut *queue)
+    };
+
+    let mut opened_preview = false;
+    for path in documents {
+        if open_document(app, &path) == DocumentOpen::Preview {
+            opened_preview = true;
+        }
+    }
+    opened_preview
+}
+
+/// How a document that the operating system handed to the app was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentOpen {
+    /// The document is displayed in a standalone window of its own.
+    Preview,
+    /// The document was selected inside the main application window.
+    Selected,
+    /// The document could not be opened.
+    Failed,
+}
+
+/// Show a Markdown file that the operating system asked the app to open.
+fn open_document(app: &AppHandle, path: &Path) -> DocumentOpen {
+    if open_files_in_preview_mode(app) {
+        // Show only the document, without revealing the application UI.
+        return match create_preview_window(app, &path.to_string_lossy()) {
+            Ok(()) => DocumentOpen::Preview,
+            Err(_) => DocumentOpen::Failed,
+        };
+    }
+
+    if try_select_in_notes_folder(app, path) {
+        return DocumentOpen::Selected;
+    }
+
+    match create_preview_window(app, &path.to_string_lossy()) {
+        Ok(()) => DocumentOpen::Preview,
+        Err(_) => DocumentOpen::Failed,
+    }
+}
+
 /// Whether a document preview window is currently open.
 fn has_preview_window(app: &AppHandle) -> bool {
     app.webview_windows()
@@ -3807,10 +3883,6 @@ fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
 fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
     let mut opened_file = false;
     let mut opened_preview = false;
-    // When enabled, a file handed to the app by the operating system is shown
-    // on its own, without revealing the full application UI.
-    let direct_file_open = open_files_in_preview_mode(app);
-
     for arg in args.iter().skip(1) {
         // Skip flags
         if arg.starts_with('-') {
@@ -3825,13 +3897,7 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
 
         if is_markdown_extension(&path) && path.is_file() {
             opened_file = true;
-            let shown = if direct_file_open {
-                create_preview_window(app, &path.to_string_lossy()).is_ok()
-            } else {
-                try_select_in_notes_folder(app, &path)
-                    || create_preview_window(app, &path.to_string_lossy()).is_ok()
-            };
-            if shown {
+            if open_document(app, &path) == DocumentOpen::Preview {
                 opened_preview = true;
             }
         } else if path.is_dir() {
@@ -3982,7 +4048,7 @@ pub fn run() {
             // see the preview. When no notes folder is configured yet, the main window is
             // always shown so new users can complete onboarding via the FolderPicker.
             let args: Vec<String> = std::env::args().collect();
-            let opened_preview = if args.len() > 1 {
+            let mut opened_preview = if args.len() > 1 {
                 let cwd = std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
@@ -3991,6 +4057,9 @@ pub fn run() {
             } else {
                 false
             };
+
+            // Documents that macOS delivered before the setup closure ran.
+            opened_preview |= open_queued_documents(app.handle());
 
             if let Some(main_window) = app.get_webview_window("main") {
                 let has_notes_folder = app
@@ -4012,6 +4081,14 @@ pub fn run() {
                     //   for onboarding, even if a preview is also showing).
                     let _ = main_window.show();
                 }
+            }
+
+            // From now on documents are opened as soon as they arrive.
+            set_app_ready();
+
+            // Catch documents that were delivered while the startup sequence ran.
+            if open_queued_documents(app.handle()) {
+                hide_main_window_for_preview(app.handle());
             }
 
             Ok(())
@@ -4123,21 +4200,16 @@ pub fn run() {
             }
 
             if let tauri::RunEvent::Opened { urls } = _event {
-                // When enabled, the opened document is shown on its own instead of
-                // revealing the full application UI.
-                let direct_file_open = open_files_in_preview_mode(_app_handle);
-
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
                         if is_markdown_extension(&path) && path.is_file() {
-                            if direct_file_open {
-                                if create_preview_window(_app_handle, &path.to_string_lossy())
-                                    .is_ok()
-                                {
-                                    hide_main_window_for_preview(_app_handle);
-                                }
-                            } else if !try_select_in_notes_folder(_app_handle, &path) {
-                                let _ = create_preview_window(_app_handle, &path.to_string_lossy());
+                            // The document is queued first so that it is never lost
+                            // when it arrives before the app finished starting.
+                            queue_opened_document(path);
+
+                            if is_app_ready() && open_queued_documents(_app_handle) {
+                                // The document replaces the application UI.
+                                hide_main_window_for_preview(_app_handle);
                             }
                         }
                     }
