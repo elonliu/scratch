@@ -319,8 +319,8 @@ export function GeneralSettingsSection() {
             </div>
             <p className="text-sm text-text-muted max-w-lg">
               Double-click a Markdown file to show only that document, without
-              opening the main app window. Useful when Scratch is your default
-              Markdown app.
+              opening the main app window. Closing that document ends the
+              session. Useful when Scratch is your default Markdown app.
             </p>
           </div>
           <SettingsToggle
@@ -343,7 +343,7 @@ export function GeneralSettingsSection() {
             </div>
             <p className="text-sm text-text-muted max-w-lg">
               Restore the window size from your last session the next time you
-              open Scratch.
+              open Scratch, both for the app window and for the document windows.
             </p>
           </div>
           <SettingsToggle
@@ -824,8 +824,10 @@ function SettingsToggle({
   useEffect(() => {
     invoke<Settings>("get_settings")
       .then((s) => {
-        const value = s[settingKey];
-        setEnabled(value === undefined ? defaultEnabled : value);
+        // The backend sends `null` for settings that were never written, so
+        // both `null` and `undefined` mean "use the default".
+        const value = s[settingKey] as boolean | null | undefined;
+        setEnabled(value == null ? defaultEnabled : value);
       })
       .catch((error) => {
         console.error(`Failed to load ${label} setting:`, error);

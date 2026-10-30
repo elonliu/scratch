@@ -112,6 +112,10 @@ pub struct AppConfig {
     /// `rememberWindowSize` setting is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_size: Option<WindowSize>,
+    /// Last size of the standalone document windows, restored the next time a
+    /// document is opened when the `rememberWindowSize` setting is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_window_size: Option<WindowSize>,
 }
 
 // Per-folder settings (stored in .scratch/settings.json within notes folder)
@@ -150,11 +154,11 @@ pub struct Settings {
     /// When enabled, a Markdown file opened from the operating system is shown
     /// in a standalone window containing only that document, instead of the
     /// full application UI. Defaults to enabled when unset.
-    #[serde(rename = "openFilesInPreviewMode")]
+    #[serde(rename = "openFilesInPreviewMode", skip_serializing_if = "Option::is_none")]
     pub open_files_in_preview_mode: Option<bool>,
     /// When enabled, the main window is restored to the size it had when the
     /// app was last closed. Defaults to enabled when unset.
-    #[serde(rename = "rememberWindowSize")]
+    #[serde(rename = "rememberWindowSize", skip_serializing_if = "Option::is_none")]
     pub remember_window_size: Option<bool>,
 }
 
@@ -795,22 +799,46 @@ fn is_remember_window_size(settings: &Settings) -> bool {
     settings.remember_window_size.unwrap_or(true)
 }
 
-/// Store the current main-window size in the app config so it can be restored
+/// Which window a remembered size belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowKind {
+    /// The main application window.
+    Main,
+    /// A standalone document window that shows a single Markdown file.
+    Preview,
+}
+
+/// Apply a new size to a remembered window size slot.
+/// Returns true when the stored size actually changed.
+fn apply_window_size(slot: &mut Option<WindowSize>, width: f64, height: f64) -> bool {
+    match slot {
+        Some(size) => {
+            if (size.width - width).abs() < 0.5 && (size.height - height).abs() < 0.5 {
+                return false;
+            }
+            size.width = width;
+            size.height = height;
+        }
+        None => {
+            *slot = Some(WindowSize { width, height });
+        }
+    }
+    true
+}
+
+/// Store the current size of a window in the app config so it can be restored
 /// on the next launch. The size is only written when it actually changed.
-fn store_window_size(app: &AppHandle, state: &AppState, width: f64, height: f64) {
+fn store_window_size(app: &AppHandle, state: &AppState, kind: WindowKind, width: f64, height: f64) {
     {
         let mut app_config = state.app_config.write().expect("app_config write lock");
-        match app_config.window_size.as_mut() {
-            Some(size) => {
-                if (size.width - width).abs() < 0.5 && (size.height - height).abs() < 0.5 {
-                    return;
-                }
-                size.width = width;
-                size.height = height;
+        let changed = match kind {
+            WindowKind::Main => apply_window_size(&mut app_config.window_size, width, height),
+            WindowKind::Preview => {
+                apply_window_size(&mut app_config.preview_window_size, width, height)
             }
-            None => {
-                app_config.window_size = Some(WindowSize { width, height });
-            }
+        };
+        if !changed {
+            return;
         }
     }
 
@@ -818,10 +846,15 @@ fn store_window_size(app: &AppHandle, state: &AppState, width: f64, height: f64)
     let _ = save_app_config(app, &app_config);
 }
 
-/// Persist the main-window size after the user finished resizing it.
+/// Persist the size of a window after the user finished resizing it.
 /// Writes are debounced so dragging a window edge does not hammer the disk,
 /// and superseded jobs are dropped instead of writing stale sizes.
-fn schedule_window_size_save(app: &AppHandle, width: f64, height: f64) {
+fn schedule_window_size_save(
+    app: &AppHandle,
+    kind: WindowKind,
+    width: f64,
+    height: f64,
+) {
     let generation = match app.try_state::<AppState>() {
         Some(state) => state.window_size_generation.fetch_add(1, Ordering::SeqCst) + 1,
         None => return,
@@ -837,8 +870,26 @@ fn schedule_window_size_save(app: &AppHandle, width: f64, height: f64) {
             // A newer resize superseded this job.
             return;
         }
-        store_window_size(&app, &state, width, height);
+        store_window_size(&app, &state, kind, width, height);
     });
+}
+
+/// The size the last document window had, when window sizes are remembered.
+fn remembered_preview_window_size(app: &AppHandle) -> Option<(f64, f64)> {
+    let state = app.try_state::<AppState>()?;
+    {
+        let settings = state.settings.read().expect("settings read lock");
+        if !is_remember_window_size(&settings) {
+            return None;
+        }
+    }
+
+    let app_config = state.app_config.read().expect("app_config read lock");
+    let size = app_config.preview_window_size.as_ref()?;
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return None;
+    }
+    Some((size.width, size.height))
 }
 
 /// Restore the remembered main-window size, if any.
@@ -3801,15 +3852,33 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// Bring the main application window back once the last document preview was
-/// closed. The check is deferred so the closing window is already unregistered.
+/// Handle the closing of the last document preview window.
+/// The main window is never revealed again on its own: the app was opened as a
+/// document viewer, so showing the application UI would undo that. When the
+/// user brought the main window back themselves it stays visible, otherwise the
+/// viewer session simply ends.
 fn show_main_window_after_preview_closed(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
-        if !has_preview_window(&app) {
-            show_main_window(&app);
+        // Another document window is still open: keep the session alive.
+        if has_preview_window(&app) {
+            return;
         }
+
+        // The user opened the main window themselves: leave it alone.
+        if app
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        // The main window was hidden for the document and never shown, so the
+        // app only existed to display that document. End the session instead of
+        // revealing the notes list.
+        app.exit(0);
     });
 }
 
@@ -3837,9 +3906,13 @@ fn create_preview_window(app: &AppHandle, file_path: &str) -> Result<(), String>
     let encoded_path = urlencoding::encode(file_path);
     let url = format!("index.html?mode=preview&file={}", encoded_path);
 
+    // Reuse the size of the last document window when the user asked Scratch to
+    // remember window sizes.
+    let (width, height) = remembered_preview_window_size(app).unwrap_or((800.0, 600.0));
+
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
         .title(format!("{} — Scratch", filename))
-        .inner_size(800.0, 600.0)
+        .inner_size(width, height)
         .min_inner_size(400.0, 300.0)
         .resizable(true)
         .decorations(true);
@@ -4107,14 +4180,25 @@ pub fn run() {
                 }
             }
 
-            // Remember the main window size so it can be restored on the next launch
+            // Remember the window size so it can be restored on the next launch.
+            // The main window and the standalone document windows are stored
+            // separately because they are used in different situations.
             if let tauri::WindowEvent::Resized(size) = event {
-                if window.label() == "main" {
+                let label = window.label().to_string();
+                let kind = if label == "main" {
+                    Some(WindowKind::Main)
+                } else if label.starts_with("preview-") {
+                    Some(WindowKind::Preview)
+                } else {
+                    None
+                };
+
+                if let Some(kind) = kind {
                     let scale_factor = window.scale_factor().unwrap_or(1.0);
                     let width = size.width as f64 / scale_factor;
                     let height = size.height as f64 / scale_factor;
                     if width > 0.0 && height > 0.0 {
-                        schedule_window_size_save(window.app_handle(), width, height);
+                        schedule_window_size_save(window.app_handle(), kind, width, height);
                     }
                 }
             }
@@ -4357,6 +4441,7 @@ mod tests {
                 width: 1280.0,
                 height: 800.0,
             }),
+            ..AppConfig::default()
         };
         let json = serde_json::to_string(&config).expect("config serialize");
         assert!(json.contains("\"window_size\""));
@@ -4374,6 +4459,60 @@ mod tests {
         let legacy = r#"{"notes_folder":"/tmp/notes"}"#;
         let parsed: AppConfig = serde_json::from_str(legacy).expect("legacy config parse");
         assert!(parsed.window_size.is_none());
+        assert!(parsed.preview_window_size.is_none());
         assert_eq!(parsed.notes_folder.as_deref(), Some("/tmp/notes"));
+    }
+
+    // 条件：分别调整过主窗口和文档窗口的大小。预期：两种尺寸各自保存，互不覆盖。
+    #[test]
+    fn app_config_keeps_main_and_preview_window_sizes_separate() {
+        let mut config = AppConfig {
+            notes_folder: Some("/tmp/notes".to_string()),
+            ..AppConfig::default()
+        };
+
+        assert!(apply_window_size(
+            &mut config.window_size,
+            1000.0,
+            700.0
+        ));
+        assert!(apply_window_size(
+            &mut config.preview_window_size,
+            800.0,
+            600.0
+        ));
+
+        let main_size = config.window_size.clone().expect("main window size stored");
+        let preview_size = config
+            .preview_window_size
+            .clone()
+            .expect("preview window size stored");
+        assert_eq!(main_size.width, 1000.0);
+        assert_eq!(main_size.height, 700.0);
+        assert_eq!(preview_size.width, 800.0);
+        assert_eq!(preview_size.height, 600.0);
+
+        // 尺寸没有变化时不再写入
+        assert!(!apply_window_size(&mut config.window_size, 1000.0, 700.0));
+
+        let json = serde_json::to_string(&config).expect("config serialize");
+        let parsed: AppConfig = serde_json::from_str(&json).expect("config deserialize");
+        assert_eq!(
+            parsed.preview_window_size.expect("preview size restored").width,
+            800.0
+        );
+        assert_eq!(
+            parsed.window_size.expect("main size restored").height,
+            700.0
+        );
+    }
+
+    // 条件：两个新开关都还没有写过。预期：序列化时直接省略字段，前端按默认值渲染。
+    #[test]
+    fn unset_settings_are_omitted_from_json() {
+        let settings = Settings::default();
+        let json = serde_json::to_string(&settings).expect("settings serialize");
+        assert!(!json.contains("openFilesInPreviewMode"));
+        assert!(!json.contains("rememberWindowSize"));
     }
 }
