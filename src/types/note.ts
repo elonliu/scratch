@@ -70,3 +70,12 @@ export interface FolderNode {
   children: FolderNode[];
   notes: NoteMetadata[];
 }
+
+// macOS privacy prompt risk for the current notes folder.
+export interface MacosPermissionInfo {
+  // The notes folder lives in a folder macOS protects behind a prompt.
+  protectedFolder: boolean;
+  // The running bundle keeps its code identity across updates.
+  // null means it could not be determined.
+  stableIdentity: boolean | null;
+}
