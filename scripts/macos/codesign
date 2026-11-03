@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# codesign shim for macOS builds.
+#
+# Problem
+# -------
+# macOS remembers privacy permissions (TCC) against a "code requirement". When an
+# app is only ad-hoc signed, codesign records a requirement that pins the cdhash
+# of the exact binary:
+#
+#     designated => cdhash H"0fe055944eae9977f702ff6c13f8d87d57f3ae84"
+#
+# Every rebuild produces a new cdhash, so the stored requirement stops matching
+# and macOS asks for Documents/Desktop access again - once per file, because the
+# app walks the whole notes folder on startup. See issue #1.
+#
+# Fix
+# ---
+# Give the ad-hoc signed bundle a designated requirement that only mentions the
+# bundle identifier:
+#
+#     designated => identifier "com.scratch.app"
+#
+# The requirement stays satisfied across rebuilds, so the permission grant sticks.
+# Bundles signed with a real Developer ID identity are left untouched: their
+# default requirement already pins the Team ID and survives updates.
+#
+# Usage
+# -----
+# Put this directory at the front of PATH before running the Tauri build:
+#
+#     PATH="$PWD/scripts/macos:$PATH" APPLE_SIGNING_IDENTITY=- npm run tauri build
+#
+# The Tauri CLI shells out to `codesign` by name, so it picks up this shim.
+
+set -euo pipefail
+
+shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Locate the real codesign, skipping this directory so the shim never recurses.
+real_codesign() {
+  local dir
+  local old_ifs="$IFS"
+  IFS=':'
+  for dir in $PATH; do
+    [ "$dir" = "$shim_dir" ] && continue
+    if [ -x "$dir/codesign" ]; then
+      IFS="$old_ifs"
+      printf '%s\n' "$dir/codesign"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+codesign_bin="$(real_codesign)" || {
+  echo "codesign: no real codesign found in PATH" >&2
+  exit 1
+}
+
+args=("$@")
+if [ ${#args[@]} -eq 0 ]; then
+  exec "$codesign_bin" "${args[@]}"
+fi
+
+# Inspect the invocation: we only ever touch ad-hoc signing of an app bundle.
+identity=""
+has_sign=0
+has_requirements=0
+is_verify=0
+
+index=0
+while [ $index -lt ${#args[@]} ]; do
+  arg="${args[$index]}"
+  case "$arg" in
+    -s | --sign)
+      has_sign=1
+      index=$((index + 1))
+      identity="${args[$index]:-}"
+      ;;
+    -s=* | --sign=*)
+      has_sign=1
+      identity="${arg#*=}"
+      ;;
+    -r | --requirements)
+      has_requirements=1
+      index=$((index + 1))
+      ;;
+    -v | --verify | -vv | -vvv)
+      is_verify=1
+      ;;
+  esac
+  index=$((index + 1))
+done
+
+target="${args[${#args[@]} - 1]}"
+
+if [ "$has_sign" -ne 1 ] || [ "$is_verify" -eq 1 ] || [ "$has_requirements" -eq 1 ]; then
+  exec "$codesign_bin" "${args[@]}"
+fi
+
+# Only the ad-hoc identity needs help; a Developer ID signature is already stable.
+if [ "$identity" != "-" ]; then
+  exec "$codesign_bin" "${args[@]}"
+fi
+
+case "$target" in
+  *.app) ;;
+  *)
+    exec "$codesign_bin" "${args[@]}"
+    ;;
+esac
+
+info_plist="$target/Contents/Info.plist"
+if [ ! -f "$info_plist" ]; then
+  exec "$codesign_bin" "${args[@]}"
+fi
+
+bundle_id=""
+if command -v plutil >/dev/null 2>&1; then
+  bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$info_plist" 2>/dev/null || true)"
+fi
+if [ -z "$bundle_id" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)"
+fi
+if [ -z "$bundle_id" ]; then
+  exec "$codesign_bin" "${args[@]}"
+fi
+
+# codesign takes the requirement text as a single argument. The leading "=" tells
+# codesign to read it as literal requirement source instead of a file name.
+requirement="=designated => identifier \"$bundle_id\""
+
+last=$((${#args[@]} - 1))
+signed_args=("${args[@]:0:$last}")
+signed_args+=(-r "$requirement")
+signed_args+=("${args[$last]}")
+
+exec "$codesign_bin" "${signed_args[@]}"

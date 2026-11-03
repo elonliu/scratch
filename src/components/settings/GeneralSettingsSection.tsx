@@ -15,7 +15,7 @@ import {
   ChevronRightIcon,
   XIcon,
 } from "../icons";
-import type { Settings } from "../../types/note";
+import type { Settings, MacosPermissionInfo } from "../../types/note";
 
 // Format remote URL for display - extract user/repo from full URL
 function formatRemoteUrl(url: string | null): string {
@@ -70,6 +70,26 @@ export function GeneralSettingsSection() {
   const [isEditingRemote, setIsEditingRemote] = useState(false);
   const [noteTemplate, setNoteTemplate] = useState<string>("Untitled");
   const [previewNoteName, setPreviewNoteName] = useState<string>("Untitled");
+  const [macosPermission, setMacosPermission] =
+    useState<MacosPermissionInfo | null>(null);
+
+  // macOS only asks once per code identity, so an unsigned build that cannot
+  // keep its identity asks again on every update. Warn while the notes folder
+  // still sits in a protected location.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<MacosPermissionInfo>("get_macos_permission_info")
+      .then((info) => {
+        if (!cancelled) setMacosPermission(info);
+      })
+      .catch((error) => {
+        console.error("Failed to load macOS permission info:", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [notesFolder]);
+
   // Load template from settings on mount
   useEffect(() => {
     const loadTemplate = async () => {
@@ -282,6 +302,20 @@ export function GeneralSettingsSection() {
             </Button>
           )}
         </div>
+        {macosPermission?.protectedFolder &&
+          macosPermission.stableIdentity === false && (
+            <div className="mt-3 rounded-[10px] border border-border bg-bg-muted px-3 py-2.5">
+              <p className="text-sm text-text">
+                macOS will keep asking for permission to read this folder
+              </p>
+              <p className="mt-1 text-xs text-text-muted">
+                This build is not signed with a code identity that survives
+                updates, so the permission cannot be remembered. Move the notes
+                folder out of Documents, Desktop or Downloads, or install a
+                build signed with a Developer ID.
+              </p>
+            </div>
+          )}
       </section>
 
       {/* Divider */}

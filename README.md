@@ -50,6 +50,16 @@ brew install --cask erictli/tap/scratch
 2. Open the DMG and drag Scratch to Applications
 3. Open Scratch from Applications
 
+#### Folder permissions on macOS
+
+macOS protects `Documents`, `Desktop` and `Downloads` behind a privacy prompt. If you keep your
+notes folder in one of them, Scratch asks for permission the first time it reads that folder, and
+the answer is remembered for the installed build.
+
+If the prompt keeps coming back after every update, the installed build is not signed with a code
+identity that survives updates. Either install a build signed with a Developer ID, or move the
+notes folder somewhere unprotected (for example `~/Notes`).
+
 ### Windows
 
 Download the latest `.exe` installer from [Releases](https://github.com/erictli/scratch/releases) and run it. WebView2 will be downloaded automatically if needed.

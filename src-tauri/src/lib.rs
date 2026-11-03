@@ -502,6 +502,52 @@ fn strip_frontmatter(content: &str) -> &str {
     content
 }
 
+/// Upper bound for the bytes read from a note while building the note list.
+///
+/// The list only needs the first lines of a note for its title and preview, so
+/// reading whole files made every refresh cost the size of the whole notes
+/// folder. On macOS each read inside a protected folder is a separate privacy
+/// check, so a narrow read also keeps the window in which a failing permission
+/// grant turns into a burst of prompts small (issue #1).
+const NOTE_LIST_READ_LIMIT: usize = 8 * 1024;
+
+/// Read the beginning of a note file.
+///
+/// Files that are not valid UTF-8 are reported as an error, the same way the
+/// previous full-file read did.
+fn read_note_head(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = vec![0u8; NOTE_LIST_READ_LIMIT];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    // The limit can cut a multi-byte character in half, so drop the incomplete
+    // tail before decoding.
+    let mut end = filled;
+    loop {
+        match std::str::from_utf8(&buffer[..end]) {
+            Ok(text) => return Ok(text.to_string()),
+            // An incomplete sequence at the end of the buffer: drop one byte and retry.
+            Err(error) if error.error_len().is_none() && end > 0 => end -= 1,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            }
+        }
+    }
+}
+
 // Utility: Extract title from markdown content
 fn extract_title(content: &str) -> String {
     let body = strip_frontmatter(content);
@@ -1042,6 +1088,110 @@ fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState
 
 // TAURI COMMANDS
 
+/// Risk that macOS keeps asking for permission to read the notes folder.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacosPermissionInfo {
+    /// The notes folder lives in a folder macOS protects behind a prompt.
+    pub protected_folder: bool,
+    /// The running bundle keeps its code identity across updates. `None` when
+    /// it could not be determined.
+    pub stable_identity: Option<bool>,
+}
+
+/// Folders macOS guards behind a privacy prompt.
+#[cfg(target_os = "macos")]
+const MACOS_PROTECTED_FOLDERS: [&str; 3] = ["Documents", "Desktop", "Downloads"];
+
+/// Whether the path sits inside a folder macOS protects.
+#[cfg(target_os = "macos")]
+fn is_macos_protected_path(path: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let path = Path::new(path);
+    MACOS_PROTECTED_FOLDERS
+        .iter()
+        .any(|name| path.starts_with(Path::new(&home).join(name)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_protected_path(_path: &str) -> bool {
+    false
+}
+
+/// The `.app` bundle the running executable belongs to.
+#[cfg(target_os = "macos")]
+fn enclosing_app_bundle() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let macos_dir = executable.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos_dir.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    let bundle = contents.parent()?;
+    if bundle.extension()? != "app" {
+        return None;
+    }
+    Some(bundle.to_path_buf())
+}
+
+/// Whether the running bundle keeps the same code identity across updates.
+///
+/// macOS stores a privacy grant against a code requirement. A bundle signed
+/// with a Developer ID keeps that requirement stable, but an ad-hoc signature
+/// without a designated requirement pins the cdhash of that exact binary, so
+/// every update invalidates the grant (issue #1).
+#[cfg(target_os = "macos")]
+fn has_stable_code_identity() -> Option<bool> {
+    let bundle = enclosing_app_bundle()?;
+    let output = std::process::Command::new("codesign")
+        .args(["-d", "-r-"])
+        .arg(&bundle)
+        .output()
+        .ok()?;
+    let requirement = String::from_utf8_lossy(&output.stdout);
+    let requirement = requirement
+        .lines()
+        .find(|line| line.contains("designated"))?;
+    if requirement.contains("cdhash") {
+        Some(false)
+    } else if requirement.contains("identifier") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_stable_code_identity() -> Option<bool> {
+    None
+}
+
+/// The code identity of a bundle never changes while it runs.
+static STABLE_CODE_IDENTITY: LazyLock<Option<bool>> = LazyLock::new(has_stable_code_identity);
+
+#[tauri::command]
+fn get_macos_permission_info(state: State<AppState>) -> MacosPermissionInfo {
+    let notes_folder = state
+        .app_config
+        .read()
+        .expect("app_config read lock")
+        .notes_folder
+        .clone();
+
+    MacosPermissionInfo {
+        protected_folder: notes_folder
+            .as_deref()
+            .map(is_macos_protected_path)
+            .unwrap_or(false),
+        stable_identity: *STABLE_CODE_IDENTITY,
+    }
+}
+
 #[tauri::command]
 fn get_notes_folder(state: State<AppState>) -> Option<String> {
     state
@@ -1094,7 +1244,7 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
                 continue;
             }
             if let Some(id) = id_from_abs_path(&path_clone, file_path, &ignored_dirs) {
-                if let Ok(content) = std::fs::read_to_string(file_path) {
+                if let Ok(content) = read_note_head(file_path) {
                     let modified = entry
                         .metadata()
                         .ok()
@@ -4242,6 +4392,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_notes_folder,
             set_notes_folder,
+            get_macos_permission_info,
             list_notes,
             read_note,
             save_note,
@@ -4544,5 +4695,69 @@ mod tests {
         let json = serde_json::to_string(&settings).expect("settings serialize");
         assert!(!json.contains("openFilesInPreviewMode"));
         assert!(!json.contains("rememberWindowSize"));
+    }
+
+    /// 在临时目录里放一个笔记文件，返回它的路径。
+    fn write_temp_note(name: &str, content: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join("scratch-note-head-tests");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write note");
+        path
+    }
+
+    // 条件：笔记正文远长于读取上限。预期：只读到开头一段，标题和预览依然可用。
+    #[test]
+    fn read_note_head_stops_at_the_limit() {
+        let mut content = String::from("# Title\n\nPreview line\n");
+        content.push_str(&"x".repeat(NOTE_LIST_READ_LIMIT));
+        let path = write_temp_note("long.md", content.as_bytes());
+
+        let head = read_note_head(&path).expect("read note head");
+        assert!(head.len() <= NOTE_LIST_READ_LIMIT);
+        assert_eq!(extract_title(&head), "Title");
+        assert_eq!(generate_preview(&head), "Preview line");
+    }
+
+    // 条件：读取上限正好切在一个多字节字符中间。预期：不会报错，末尾残缺的字符被丢掉。
+    #[test]
+    fn read_note_head_drops_incomplete_character_at_the_limit() {
+        let mut content = vec![b'a'; NOTE_LIST_READ_LIMIT - 1];
+        content.extend_from_slice("é".as_bytes());
+        content.extend_from_slice(b"tail");
+        let path = write_temp_note("multibyte.md", &content);
+
+        let head = read_note_head(&path).expect("read note head");
+        assert!(head.chars().all(|character| character == 'a'));
+    }
+
+    // 条件：笔记文件不是合法 UTF-8。预期：返回错误，该笔记在列表里被跳过。
+    #[test]
+    fn read_note_head_rejects_invalid_utf8() {
+        let path = write_temp_note("invalid.md", &[0xff, 0xfe, 0x00]);
+
+        assert!(read_note_head(&path).is_err());
+    }
+
+    // 条件：笔记文件比读取上限短。预期：完整读到内容，末尾没有多余的填充字节。
+    #[test]
+    fn read_note_head_reads_short_files_fully() {
+        let path = write_temp_note("short.md", b"# Title\n\nPreview line\n");
+
+        let head = read_note_head(&path).expect("read note head");
+        assert_eq!(head, "# Title\n\nPreview line\n");
+    }
+
+    // 条件：笔记文件夹位于 ~/Documents 之下。预期：判定为受保护目录；同名前缀的目录不算。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_protected_folders_are_detected() {
+        let home = std::env::var("HOME").expect("home dir");
+
+        assert!(is_macos_protected_path(&format!("{home}/Documents/Notes")));
+        assert!(!is_macos_protected_path(&format!("{home}/Notes")));
+        assert!(!is_macos_protected_path(&format!(
+            "{home}/DocumentsBackup/Notes"
+        )));
     }
 }
