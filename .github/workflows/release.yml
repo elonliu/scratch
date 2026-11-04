@@ -10,7 +10,39 @@ permissions:
   contents: write
 
 jobs:
+  # The three platform jobs below run in parallel, and tauri-action creates the
+  # release when it cannot find a draft with the target tag. Two jobs racing
+  # therefore produce two drafts with the same tag: assets end up split across
+  # them and each latest.json only carries the platforms of the job that wrote
+  # it last. Creating the draft up front gives every platform job the same
+  # release to upload to, and tauri-action merges the platform entries into a
+  # single latest.json.
+  prepare-release:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists, reusing it."
+          else
+            gh release create "$tag" \
+              --draft \
+              --title "Scratch v${version}" \
+              --notes "See the release page for full details. Download the app for your platform below."
+            echo "Created draft release $tag."
+          fi
+
   build-and-release:
+    needs: prepare-release
+
     strategy:
       fail-fast: false
       matrix:
