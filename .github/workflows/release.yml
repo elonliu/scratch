@@ -33,8 +33,11 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists, reusing it."
           else
+            # --target pins the tag to the commit that is being released, so a
+            # workflow_dispatch run on a branch does not tag the default branch.
             gh release create "$tag" \
               --draft \
+              --target "$GITHUB_SHA" \
               --title "Scratch v${version}" \
               --notes "See the release page for full details. Download the app for your platform below."
             echo "Created draft release $tag."
